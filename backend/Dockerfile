@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy project definition
 COPY pyproject.toml /app/
 
+ENV PIP_ROOT_USER_ACTION=ignore
 # Install python dependencies
 # Using pip to install directly from pyproject.toml (requires modern pip)
 RUN pip install --no-cache-dir --upgrade pip && \
