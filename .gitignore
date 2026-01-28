@@ -26,6 +26,8 @@ backend/build/
 backend/.mypy_cache/
 backend/.ruff_cache/
 backend/*.egg-info/
+backend/**/cache/
+backend/data/
 *.egg-info/
 __pycache__/
 *.pyc
