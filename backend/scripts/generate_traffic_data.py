@@ -38,9 +38,6 @@ def setup_args():
     parser.add_argument(
         "--workers", type=int, default=os.cpu_count(), help="Number of parallel workers"
     )
-    parser.add_argument(
-        "--step-length", type=float, default=1.0, help="Simulation step length in seconds"
-    )
     return parser.parse_args()
 
 
@@ -69,8 +66,8 @@ def get_traffic_intensity(hour_of_day: float, day_of_week: str) -> float:
     return np.clip(intensity, 0.1, 1.0)
 
 
-def get_sumo_period(intensity: float, min_p=0.4, max_p=5.0) -> float:
-    """Converts intensity (1.0=high) to SUMO period (0.4s=high freq)."""
+def get_sumo_period(intensity: float, min_p=2.0, max_p=10.0) -> float:
+    """Converts intensity (1.0=high) to SUMO period (2.0s=high freq)."""
     return min_p + (1.0 - intensity) * (max_p - min_p)
 
 
@@ -179,6 +176,8 @@ def build_sumo_network(osm_path, output_dir, name):
         check=True,
     )
 
+    return net_file
+
 
 def generate_route_file(net_file, output_dir, name, duration, period, unique_id):
     """Generates demand for a specific episode."""
@@ -208,6 +207,12 @@ def generate_route_file(net_file, output_dir, name, duration, period, unique_id)
             str(duration),
             "--period",
             str(period),
+            "--fringe-factor",
+            "10",  # Prefer starting/ending at network edges
+            "--min-distance",
+            "800",  # Only generate trips longer than 800m
+            "--trip-attributes",
+            'departLane="best" departSpeed="max" departPos="random"',
             "--validate",
         ],
         check=True,
@@ -298,7 +303,6 @@ def worker_simulation_task(
     base_name,
     duration,
     static_features,
-    step_length,
 ):
     """
     Worker function executed in a separate process.
@@ -332,8 +336,9 @@ def worker_simulation_task(
     partial_csv = os.path.join(output_dir, f"partial_{unique_id}.csv")
 
     # Start Simulation
-    # Note: libsumo doesn't use sumo-cmd, it links directly.
-    # args are list of strings
+    # FORCE efficient step length for physics (0.5s) to ensure quality
+    PHYSICS_STEP = 0.5
+
     sumo_args = [
         "sumo",  # Dummy arg 0
         "-n",
@@ -345,12 +350,11 @@ def worker_simulation_task(
         "--no-warnings",
         "true",
         "--time-to-teleport",
-        "120",  # Teleport car if stuck for >120s (default is 300s)
+        "60",  # Teleport car if stuck for >60s (default is 300s)
         "--collision.action",
-        "remove",  # Remove cars if they crash (prevents permablocks)
+        "remove",  # Remove cars if they crash
         "--step-length",
-        str(step_length),
-        # Avoid creating log files in parallel to prevent write conflicts if same name
+        str(PHYSICS_STEP),
         "--log",
         os.devnull,
     ]
@@ -369,42 +373,40 @@ def worker_simulation_task(
     batch_data = []
     header_written = os.path.exists(partial_csv)
 
-    step = 0
-    # Simulate
-    # step_length is handled by SUMO. simulationStep() advances by one step.
-    # If step-length is 1.0, step+=1. If 0.5, step+=1 means 1 step (0.5s).
-    # We want to sample every 10 minutes (600 seconds).
-    # steps_per_sample = 600 / step_length
-    steps_per_sample = int(600 / step_length)
-    if steps_per_sample < 1:
-        steps_per_sample = 1
+    # Sampling interval in seconds (every 10 minutes)
+    SAMPLE_INTERVAL = 600.0
 
-    total_steps = int(duration / step_length)
+    # We jump directly to next sample time using libsumo speed
+    current_time = 0.0
 
     try:
-        for _ in range(total_steps):
-            traci.simulationStep()
-            step += 1
+        while current_time < duration:
+            # Advance simulation to next sample point
+            target_time = current_time + SAMPLE_INTERVAL
+            if target_time > duration:
+                target_time = duration
 
-            if step % steps_per_sample == 0:
-                # Calculate effective hour of day based on elapsed time
-                elapsed_seconds = step * step_length
-                current_hour = (hour + elapsed_seconds / 3600.0) % 24.0
+            # Execute all intermediate steps in C++ loop
+            traci.simulationStep(float(target_time))
+            current_time = target_time
 
-                edge_list = traci.edge.getIDList()
-                for edge_id in edge_list:
-                    data = collect_edge_data(
-                        traci, edge_id, static_features, weather, day, current_hour
-                    )
-                    if data:
-                        batch_data.append(data)
+            # Update effective time of day
+            current_hour = (hour + current_time / 3600.0) % 24.0
 
-                # Flush to disk periodically to save memory
-                if len(batch_data) > 5000:
-                    df = pd.DataFrame(batch_data)
-                    df.to_csv(partial_csv, mode="a", header=not header_written, index=False)
-                    header_written = True
-                    batch_data = []
+            edge_list = traci.edge.getIDList()
+            for edge_id in edge_list:
+                data = collect_edge_data(
+                    traci, edge_id, static_features, weather, day, current_hour
+                )
+                if data:
+                    batch_data.append(data)
+
+            # Flush to disk periodically to save memory
+            if len(batch_data) > 5000:
+                df = pd.DataFrame(batch_data)
+                df.to_csv(partial_csv, mode="a", header=not header_written, index=False)
+                header_written = True
+                batch_data = []
 
         # Flush remaining
         if batch_data:
@@ -433,7 +435,6 @@ def main():
     static_features = get_static_features(net_file)
 
     print(f"🚀 Starting parallel generation: {args.episodes} episodes, {args.workers} workers")
-    print(f"   Step Size: {args.step_length}s, Duration: {args.duration}s")
 
     # 3. Parallel Execution
     tasks = []
@@ -448,7 +449,6 @@ def main():
         base_name=args.name,
         duration=args.duration,
         static_features=static_features,
-        step_length=args.step_length,
     )
 
     generated_files = []
@@ -493,6 +493,12 @@ def main():
                 os.remove(fname)
 
     print(f"\n✅ Data Generation Complete. Output: {args.output_csv}")
+
+    df = pd.read_csv(args.output_csv)
+    print(f"   Total Records: {len(df)}")
+    anomalies = df[(df["current_speed"] == 0.0) & (df["vehicle_count"] == 1)]
+    portion_anomalies = len(anomalies) / len(df) * 100.0
+    print(f"   Anomalies (0 speed & 1 vehicle): {len(anomalies)} ({portion_anomalies:.2f}%)")
 
 
 if __name__ == "__main__":
