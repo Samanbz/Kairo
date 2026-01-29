@@ -66,8 +66,8 @@ def get_traffic_intensity(hour_of_day: float, day_of_week: str) -> float:
     return np.clip(intensity, 0.1, 1.0)
 
 
-def get_sumo_period(intensity: float, min_p=2.0, max_p=10.0) -> float:
-    """Converts intensity (1.0=high) to SUMO period (2.0s=high freq)."""
+def get_sumo_period(intensity: float, min_p=0.05, max_p=1.0) -> float:
+    """Converts intensity to SUMO period (period is seconds per vehicle)."""
     return min_p + (1.0 - intensity) * (max_p - min_p)
 
 
@@ -208,9 +208,9 @@ def generate_route_file(net_file, output_dir, name, duration, period, unique_id)
             "--period",
             str(period),
             "--fringe-factor",
-            "10",  # Prefer starting/ending at network edges
+            "2",
             "--min-distance",
-            "800",  # Only generate trips longer than 800m
+            "500",
             "--trip-attributes",
             'departLane="best" departSpeed="max" departPos="random"',
             "--validate",
@@ -336,8 +336,7 @@ def worker_simulation_task(
     partial_csv = os.path.join(output_dir, f"partial_{unique_id}.csv")
 
     # Start Simulation
-    # FORCE efficient step length for physics (0.5s) to ensure quality
-    PHYSICS_STEP = 0.5
+    PHYSICS_STEP = 10.0
 
     sumo_args = [
         "sumo",  # Dummy arg 0
@@ -350,10 +349,12 @@ def worker_simulation_task(
         "--no-warnings",
         "true",
         "--time-to-teleport",
-        "60",  # Teleport car if stuck for >60s (default is 300s)
+        "30",
         "--collision.action",
-        "remove",  # Remove cars if they crash
+        "remove",
         "--step-length",
+        str(PHYSICS_STEP),
+        "--default.action-step-length",
         str(PHYSICS_STEP),
         "--log",
         os.devnull,
@@ -370,8 +371,20 @@ def worker_simulation_task(
     except Exception:
         print("⚠️ Warning: Could not set vehicle type parameters in SUMO.")
 
+    # Pre-fetch valid edges to avoid checking thousands of internal edges in the loop
+    all_edges = traci.edge.getIDList()
+    valid_edges = [e for e in all_edges if not e.startswith(":") and e in static_features]
+
     batch_data = []
     header_written = os.path.exists(partial_csv)
+
+    # Use a thread pool for I/O to avoid blocking simulation
+    io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    io_futures = []
+
+    def flush_data(data, filepath, write_header):
+        df = pd.DataFrame(data)
+        df.to_csv(filepath, mode="a", header=write_header, index=False)
 
     # Sampling interval in seconds (every 10 minutes)
     SAMPLE_INTERVAL = 600.0
@@ -393,8 +406,8 @@ def worker_simulation_task(
             # Update effective time of day
             current_hour = (hour + current_time / 3600.0) % 24.0
 
-            edge_list = traci.edge.getIDList()
-            for edge_id in edge_list:
+            # Use pre-filtered edge list
+            for edge_id in valid_edges:
                 data = collect_edge_data(
                     traci, edge_id, static_features, weather, day, current_hour
                 )
@@ -403,15 +416,24 @@ def worker_simulation_task(
 
             # Flush to disk periodically to save memory
             if len(batch_data) > 5000:
-                df = pd.DataFrame(batch_data)
-                df.to_csv(partial_csv, mode="a", header=not header_written, index=False)
+                # Submit I/O task to background thread
+                io_futures.append(
+                    io_executor.submit(flush_data, batch_data, partial_csv, not header_written)
+                )
                 header_written = True
-                batch_data = []
+                batch_data = []  # Reset buffer
 
         # Flush remaining
         if batch_data:
-            df = pd.DataFrame(batch_data)
-            df.to_csv(partial_csv, mode="a", header=not header_written, index=False)
+            io_futures.append(
+                io_executor.submit(flush_data, batch_data, partial_csv, not header_written)
+            )
+
+        # Wait for all I/O to complete
+        for f in io_futures:
+            f.result()
+
+        io_executor.shutdown()
 
     finally:
         traci.close()
