@@ -27,7 +27,11 @@ backend/.mypy_cache/
 backend/.ruff_cache/
 backend/*.egg-info/
 backend/**/cache/
-backend/data/
+**/data/
+**/sumo_data/
+*.xml
+*.csv
+
 *.egg-info/
 __pycache__/
 *.pyc
