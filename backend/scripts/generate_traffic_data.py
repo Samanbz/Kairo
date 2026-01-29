@@ -147,7 +147,6 @@ def build_sumo_network(osm_path, output_dir, name):
     print("🛠️  Converting OSM to SUMO Network...")
     net_file = os.path.join(output_dir, f"{name}.net.xml")
 
-    # 1. netconvert
     subprocess.run(
         [
             "netconvert",
@@ -155,18 +154,30 @@ def build_sumo_network(osm_path, output_dir, name):
             osm_path,
             "-o",
             net_file,
-            "--geometry.remove",
-            "--roundabouts.guess",
-            "--ramps.guess",
-            "--junctions.join",
+            # 1. Geometry Fixes
+            "--geometry.remove",  # Remove unneeded shape nodes
+            "--roundabouts.guess",  # Fix roundabouts
+            "--ramps.guess",  # Fix highway on-ramps
+            # 2. Junction Merging (The Magic Fix)
+            "--junctions.join",  # Merge close junctions
+            "--junctions.join-dist",
+            "20",  # Merge nodes within 20m (Aggressive!)
+            "--junctions.corner-detail",
+            "5",
+            # 3. Traffic Light Smarts
             "--tls.guess-signals",
-            "--tls.discard-simple",
-            "--tls.join",
+            "--tls.discard-simple",  # Remove lights at tiny intersections
+            "--tls.join",  # Merge traffic lights at complex junctions
+            "--tls.default-type",
+            "actuated",  # Smart lights (green when car detected)
+            # 4. Pruning (Remove tiny garbage edges)
+            "--remove-edges.isolated",  # Remove islands
+            "--keep-edges.min-speed",
+            "5",  # Remove walking paths/service roads (<18km/h)
             "--no-warnings",
         ],
         check=True,
     )
-    return net_file
 
 
 def generate_route_file(net_file, output_dir, name, duration, period, unique_id):
@@ -333,6 +344,10 @@ def worker_simulation_task(
         "true",
         "--no-warnings",
         "true",
+        "--time-to-teleport",
+        "120",  # Teleport car if stuck for >120s (default is 300s)
+        "--collision.action",
+        "remove",  # Remove cars if they crash (prevents permablocks)
         "--step-length",
         str(step_length),
         # Avoid creating log files in parallel to prevent write conflicts if same name
@@ -378,7 +393,9 @@ def worker_simulation_task(
 
                 edge_list = traci.edge.getIDList()
                 for edge_id in edge_list:
-                    data = collect_edge_data(traci, edge_id, static_features, weather, day, current_hour)
+                    data = collect_edge_data(
+                        traci, edge_id, static_features, weather, day, current_hour
+                    )
                     if data:
                         batch_data.append(data)
 
