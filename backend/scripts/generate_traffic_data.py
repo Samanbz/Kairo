@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+import multiprocessing
 import os
 import random
 import subprocess
@@ -36,9 +37,32 @@ def setup_args():
         "--episodes", type=int, default=20, help="Number of simulation episodes to run"
     )
     parser.add_argument("--name", type=str, default="network", help="Base name for generated files")
+
+    # Cluster & Robustness Args
+    # Detect SLURM environment for defaults
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    default_workers = int(slurm_cpus) if slurm_cpus else os.cpu_count()
+
     parser.add_argument(
-        "--workers", type=int, default=os.cpu_count(), help="Number of parallel workers"
+        "--workers", type=int, default=default_workers, help="Number of parallel workers"
     )
+    parser.add_argument(
+        "--job-id",
+        type=str,
+        default=os.environ.get("SLURM_JOB_ID", "local"),
+        help="Unique Identifier for this job/node (defaults to SLURM_JOB_ID or 'local')",
+    )
+    parser.add_argument(
+        "--skip-setup",
+        action="store_true",
+        help="Skip map download and network build (prevents race conditions on shared FS)",
+    )
+    parser.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="Skip merging of partial files (useful for massive datasets)",
+    )
+
     return parser.parse_args()
 
 
@@ -251,7 +275,18 @@ WEATHER_PROFILES = {
 }
 
 
-def get_static_features(net_file):
+def get_static_features(net_file, output_dir):
+    cache_file = os.path.join(output_dir, "static_features_cache.json")
+
+    # Try to load from cache first to save costly computation on every worker/node
+    if os.path.exists(cache_file):
+        print(f"   Loading static features from cache: {cache_file}")
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"   Cache load failed ({e}), recomputing...")
+
     print("   Parsing road network topology...")
     net = sumolib.net.readNet(net_file)
 
@@ -267,7 +302,7 @@ def get_static_features(net_file):
     # Closeness: High score = "Central" road (Close to everything else, e.g. City Center)
     # Note: This can be slow for large maps, but is computed only once per static map.
     print("   Computing Betweenness Centrality (Topology Importance)...")
-    betweenness = nx.betweenness_centrality(G, weight="weight", k=None)  # k=None implies exact calc
+    betweenness = nx.betweenness_centrality(G, weight="weight", k=300)  # k=None implies exact calc
 
     print("   Computing Closeness Centrality (Geometric Centrality)...")
     closeness = nx.closeness_centrality(G, distance="weight")
@@ -288,6 +323,14 @@ def get_static_features(net_file):
             "betweenness": betweenness.get(from_id, 0.0),
             "closeness": closeness.get(from_id, 0.0),
         }
+
+    # Save cache
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(features, f)
+    except Exception as e:
+        print(f"   Warning: Could not save static feature cache: {e}")
+
     return features
 
 
@@ -328,11 +371,11 @@ def worker_simulation_task(
     base_name,
     duration,
     static_features,
+    job_id,
 ):
     """
     Worker function executed in a separate process.
     """
-
     # Randomize parameters for this episodes
     days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     weathers = ["Clear", "Rain", "Snow"]
@@ -342,8 +385,8 @@ def worker_simulation_task(
     hour = random.randint(0, 23)
     weather = np.random.choice(weathers, p=weather_weights)
 
-    # Unique ID for this process's files
-    unique_id = f"{os.getpid()}_{episode_idx}"
+    # Unique ID for this process's files, including job_id for cluster uniqueness
+    unique_id = f"{job_id}_{episode_idx}_{os.getpid()}"
 
     # Logic for traffic intensity
     intensity = get_traffic_intensity(hour, day)
@@ -474,19 +517,27 @@ def worker_simulation_task(
 def main():
     args = setup_args()
 
-    # 1. Fetch Map
-    osm_path = fetch_map(args.lat, args.lon, args.dist, args.output_dir)
+    # 1. Fetch Map (Only if root/setup is allowed)
+    if not args.skip_setup:
+        osm_path = fetch_map(args.lat, args.lon, args.dist, args.output_dir)
+        # 2. Build Static Network
+        net_file = build_sumo_network(osm_path, args.output_dir, args.name)
+    else:
+        # If skipping setup, assume files exist
+        net_file = os.path.join(args.output_dir, f"{args.name}.net.xml")
+        if not os.path.exists(net_file):
+            print(f"❌ Error: {net_file} not found. Run without --skip-setup first.")
+            sys.exit(1)
+        print("⏭️  Skipping map download and build (--skip-setup active).")
 
-    # 2. Build Static Network
-    net_file = build_sumo_network(osm_path, args.output_dir, args.name)
-    static_features = get_static_features(net_file)
+    # Load from cache if available
+    static_features = get_static_features(net_file, args.output_dir)
 
-    print(f"🚀 Starting parallel generation: {args.episodes} episodes, {args.workers} workers")
+    print(
+        f"🚀 Starting parallel generation: {args.episodes} episodes, {args.workers} workers, Job: {args.job_id}"
+    )
 
     # 3. Parallel Execution
-    tasks = []
-    for i in range(args.episodes):
-        tasks.append(i)
 
     # Helper to clean up arguments
     worker_func = partial(
@@ -496,31 +547,42 @@ def main():
         base_name=args.name,
         duration=args.duration,
         static_features=static_features,
+        job_id=args.job_id,
     )
 
     generated_files = []
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-        # Wrap with tqdm
-        future_to_episode = {executor.submit(worker_func, i): i for i in range(args.episodes)}
+    # Use 'spawn' context for libsumo safety in multi-threaded/node environments
+    ctx = multiprocessing.get_context("spawn")
 
-        for future in tqdm(
-            concurrent.futures.as_completed(future_to_episode),
-            total=args.episodes,
-            desc="Total Progress",
-        ):
-            try:
-                result = future.result()
+    with ctx.Pool(processes=args.workers) as pool:
+        # Wrap with tqdm
+        try:
+            results = list(
+                tqdm(
+                    pool.imap(worker_func, range(args.episodes)),
+                    total=args.episodes,
+                    desc="Simulation Progress",
+                )
+            )
+
+            for result in results:
                 if isinstance(result, str) and os.path.exists(result):
                     generated_files.append(result)
                 elif isinstance(result, dict) and "error" in result:
                     print(f"⚠️ Episode failed: {result['error']}")
-            except Exception as exc:
-                print(f"❌ Worker exception: {exc}")
 
-    # 4. Merge Data
-    print("💾 Merging csv files...")
-    if generated_files:
+        except KeyboardInterrupt:
+            print("\n🛑 Interrupted! Terminating pool...")
+            pool.terminate()
+            pool.join()
+            sys.exit(1)
+
+    # 4. Merge Data (Optional)
+    if args.no_merge:
+        print(f"✅ Data Generation Complete. Partial files kept in {args.output_dir}")
+    elif generated_files:
+        print("💾 Merging csv files...")
         target_csv = args.output_csv
         first_file = True
 
@@ -532,20 +594,32 @@ def main():
                         outfile.write(header)
                         first_file = False
 
-                    # Write rest
+                    # Stream write rest
                     for line in infile:
                         outfile.write(line)
 
                 # Cleanup partial
-                os.remove(fname)
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
 
-    print(f"\n✅ Data Generation Complete. Output: {args.output_csv}")
+        print(f"\n✅ Data Generation Complete. Output: {args.output_csv}")
 
-    df = pd.read_csv(args.output_csv)
-    print(f"   Total Records: {len(df)}")
-    anomalies = df[(df["current_speed"] == 0.0) & (df["vehicle_count"] == 1)]
-    portion_anomalies = len(anomalies) / len(df) * 100.0
-    print(f"   Anomalies (0 speed & 1 vehicle): {len(anomalies)} ({portion_anomalies:.2f}%)")
+        # Only analyze if file is small enough (arbitrary check) or user requests it
+        # For huge files, pandas read_csv will crash
+        if os.path.getsize(target_csv) < 500 * 1024 * 1024:  # 500MB Limit for check
+            df = pd.read_csv(args.output_csv)
+            print(f"   Total Records: {len(df)}")
+            anomalies = df[(df["current_speed"] == 0.0) & (df["vehicle_count"] == 1)]
+            portion_anomalies = len(anomalies) / len(df) * 100.0
+            print(
+                f"   Anomalies (0 speed & 1 vehicle): {len(anomalies)} ({portion_anomalies:.2f}%)"
+            )
+        else:
+            print("   (Skipping anomaly check for large file > 500MB)")
+    else:
+        print("⚠️ No files generated.")
 
 
 if __name__ == "__main__":
