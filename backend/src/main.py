@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.routers import routing
+
 app = FastAPI(title="Kairo Optimization Engine", version="0.1.0")
 
 # CORS middleware to allow frontend communication
@@ -12,9 +14,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(routing.router)
+
+
 @app.get("/")
 async def read_root():
     return {"message": "Hello from Kairo Backend", "status": "operational"}
+
 
 @app.get("/health")
 async def health_check():
