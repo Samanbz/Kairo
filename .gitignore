@@ -17,24 +17,27 @@ Thumbs.db
 .env.production.local
 
 # Python / Backend
-backend/__pycache__/
-backend/*.py[cod]
-backend/*$py.class
-backend/venv/
-backend/.venv/
-backend/build/
-backend/.mypy_cache/
-backend/.ruff_cache/
-backend/*.egg-info/
-backend/**/cache/
-**/data/
-**/sumo_data/
-*.xml
-*.csv
-
-*.egg-info/
 __pycache__/
+*.py[cod]
+*$py.class
 *.pyc
+venv/
+.venv/
+build/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+**/.pytest_cache/
+**/lightning_logs/
+data/
+sumo_data/
+
+# Data Files (Ignored for privacy/size)
+*.tmp
+*.tfevents
+*.zip
+*.osm
+*.cbm
 
 # Node / Frontend
 node_modules/
@@ -48,8 +51,7 @@ frontend/out/
 frontend/build/
 frontend/coverage/
 
-# OS / Misc
-.DS_Store
+# Misc
 *.pem
 
 # User Requested
