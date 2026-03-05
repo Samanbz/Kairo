@@ -42,3 +42,48 @@ npm run dev
 npm run lint
 npm run format
 ```
+
+
+Setup
+
+first get city's map using `fetch_map.py`, e.g. for Darmstadt, using exact coordinates.
+then
+```
+netconvert --osm-files sumo_data/map.osm \
+  -o sumo_data/darmstadt.net.xml \
+  --geometry.remove \
+  --roundabouts.guess \
+  --ramps.guess \
+  --junctions.join \
+  --tls.guess-signals \
+  --tls.discard-simple \
+  --tls.join
+```
+```
+python /usr/share/sumo/tools/randomTrips.py \
+    -n sumo_data/darmstadt.net.xml \
+    -o sumo_data/trips.trips.xml \
+    -e 3600 \
+    --period 2.0
+```
+```
+duarouter \
+    -n sumo_data/darmstadt.net.xml \
+    --route-files sumo_data/trips.trips.xml \
+    -o sumo_data/routes.rou.xml \
+    --ignore-errors
+```
+
+create file backend/run.sumcfg
+```
+<configuration>
+    <input>
+        <net-file value="./sumo_data/darmstadt.net.xml"/>
+        <route-files value="routes.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+    </time>
+</configuration>
+```

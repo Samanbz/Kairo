@@ -1,7 +1,7 @@
 cd backend
 conda activate kairo
 
-pip install ./ -e
+pip install ./
 
 fastapi dev main.py &
 
