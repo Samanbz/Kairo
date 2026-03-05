@@ -38,6 +38,10 @@ sumo_data/
 *.zip
 *.osm
 *.cbm
+*.xml
+*.txt
+routes.rou.xml
+sumo_log.txt
 
 # Node / Frontend
 node_modules/
