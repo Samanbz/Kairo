@@ -1,2 +1,8 @@
 @import "tailwindcss";
 
+@layer base {
+  body {
+    font-family: 'Fustat', sans-serif;
+  }
+}
+
